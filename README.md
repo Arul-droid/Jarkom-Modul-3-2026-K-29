@@ -1,6 +1,100 @@
 # Jarkom-Modul-3-2026-K-29
 
 1. Ketika Curtain menutup Shibuya, jalur komunikasi antar zona Jujutsu High terputus. Pulihkan konektivitas dasar dengan mengonfigurasi jichi: eth0 memperoleh WAN dari NAT, sedangkan eth1–eth4 menjadi gateway Network 1–4 sesuai tabel pemetaan. Aktifkan IPv4 forwarding dan source NAT, lalu tetapkan IP statis host infrastruktur sesuai tabel spesifikasi. Buktikan konektivitas setiap host ke gateway dan akses eksternal dari host yang relevan.
+
+terminal jichi
+```bash
+nano /root/soal1.sh 
+```
+```bash
+#!/bin/bash
+echo "Konfigurasi jichi dimulai..."
+
+dhclient -v eth0
+
+ip addr flush dev eth1; ip addr add 10.78.1.1/24 dev eth1; ip link set eth1 up
+ip addr flush dev eth2; ip addr add 10.78.2.1/24 dev eth2; ip link set eth2 up
+ip addr flush dev eth3; ip addr add 10.78.3.1/24 dev eth3; ip link set eth3 up
+ip addr flush dev eth4; ip addr add 10.78.4.1/24 dev eth4; ip link set eth4 up
+
+echo 1 > /proc/sys/net/ipv4/ip_forward
+sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/g' /etc/sysctl.conf
+
+apt-get update
+apt-get install -y iptables
+
+iptables -t nat -F
+iptables -F FORWARD
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+iptables -P FORWARD ACCEPT
+
+echo "Konfigurasi jichi selesai."
+```
+```bash
+chmod +x /root/soal1.sh
+./root/soal1.sh
+```
+
+terminal tengen
+```bash
+nano /root/soal1.sh
+```
+```bash
+#!/bin/bash
+echo "Konfigurasi IP Statis tengen..."
+ip addr flush dev eth0
+ip addr add 10.78.4.10/24 dev eth0
+ip link set eth0 up
+ip route add default via 10.78.4.1
+echo "nameserver 192.168.122.1" > /etc/resolv.conf
+
+echo "Test koneksi ke internet:"
+ping -c 3 8.8.8.8
+```
+```bash
+chmod +x /root/soal1.sh
+./root/soal1.sh
+```
+terminal network 1
+```bash
+nano /root/soal1.sh
+```
+```bash
+#!/bin/bash
+ip addr flush dev eth0
+ip addr add 10.78.x.x/24 dev eth0
+ip link set eth0 up
+ip route add default via 10.78.x.1
+echo "nameserver 192.168.122.1" > /etc/resolv.conf
+
+echo "Test koneksi ke internet:"
+ping -c 3 8.8.8.8
+```
+```bash
+chmod +x /root/soal1.sh
+./root/soal1.sh
+```
+terminal network 4
+```bash
+nano soal1.sh
+```
+```bash
+#!/bin/bash
+# UBAH ANGKA IP DI BAWAH INI SESUAI NAMA HOST
+# Contoh: geto=2, maki=3, panda=4, ..., tengen=10
+IP_HOST="10.78.4.2"
+
+echo "Konfigurasi IP Statis: $IP_HOST"
+ip addr flush dev eth0
+ip addr add $IP_HOST/24 dev eth0
+ip link set eth0 up
+ip route add default via 10.78.4.1
+echo "nameserver 192.168.122.1" > /etc/resolv.conf
+
+echo "Test koneksi ke internet:"
+ping -c 3 8.8.8.8
+```
+
 2. Tengen, penjaga pusat distribusi di Data Center, harus mengambil alih pengalokasian alamat bagi wilayah yang membutuhkan konfigurasi dinamis. Konfigurasikan isc-dhcp-server pada [PREFIX IP].4.10. Deklarasikan Network 4 ([PREFIX IP].4.0/24) sebagai subnet lokal tanpa pool dinamis, lalu siapkan scope DHCP untuk Network 2 ([PREFIX IP].2.0/24) dan Network 3 ([PREFIX IP].3.0/24). Validasi konfigurasi dan pastikan service aktif tanpa error “No subnet declaration”.
 3. Permintaan alamat dari Divisi A dan Divisi B tidak dapat menyeberangi subnet secara langsung. Konfigurasikan jichi sebagai DHCP Relay menuju tengen ([PREFIX IP].4.10), menggunakan eth2 untuk Network 2 dan eth3 untuk Network 3. Buktikan bahwa client dari kedua subnet berhasil memperoleh lease melalui relay.
 4. Agar tim Dev dan Support di Divisi A menerima jatah alamat yang berbeda, atur dua pool DHCP pada Network 2. Tetapkan Pool 1 ([PREFIX IP].2.10–[PREFIX IP].2.35) untuk itadori dan fushiguro, serta Pool 2 ([PREFIX IP].2.70–[PREFIX IP].2.95) untuk zenin dan okkotsu. Rentang [PREFIX IP].2.36–[PREFIX IP].2.69 tidak boleh dialokasikan. Karena seluruh client berada pada subnet yang sama, gunakan DHCP class berdasarkan MAC Address atau Client ID untuk memisahkan kedua kelompok.
