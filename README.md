@@ -1185,11 +1185,743 @@ ping -c 3 google.com
 
 ---
 
-13. Kepala Sekolah Yaga dan Inumaki mendirikan database terpusat yang redundan agar log aktivitas kutukan tetap aman tersimpan. Konfigurasikan MariaDB pada yaga sebagai DB-Master dan inumaki sebagai DB-Slave. Buat database db_shibuya_<xxxx> beserta tabel request_logs di Master, aktifkan binary logging (log-bin, server-id), lalu hubungkan inumaki sebagai Slave yang menyalin data secara realtime dengan CHANGE MASTER TO. Berikan hak akses remote bagi seluruh node di Network 4, lalu buktikan replikasi berhasil dengan memasukkan data baru di Master dan memeriksa hasilnya di Slave.
-14. Para penyihir lapangan bersiaga di Data Center sebagai pekerja backend untuk memproses aplikasi. Pasang Nginx dan PHP-FPM pada maki dan panda untuk menyajikan web frontend yang menampilkan hostname masing-masing. Pada nanami, todo, dan kirara, siapkan layanan API yang mencatat log request ke database yaga. Konfigurasikan virtual host agar worker merespons domain layanan yang ditentukan. Batasi akses langsung dari klien ke worker, web worker hanya menerima trafik melalui jalur proxy web yang ditentukan, sedangkan worker API hanya menerima trafik melalui geto. Uji bahwa akses langsung dari klien ditolak, sementara akses melalui reverse proxy tetap berhasil.
-15. Geto bertugas mengendalikan pembagian beban request API di internal Data Center agar server tidak tumbang bersamaan. Konfigurasikan Nginx pada geto sebagai Load Balancer internal dengan upstream api_cluster yang mengarahkan trafik ke nanami dan todo. Terapkan algoritma Weighted Round Robin dengan bobot 3:1, di mana nanami menerima porsi beban tiga kali lebih banyak daripada todo. Buktikan distribusi beban ini dengan melakukan loop request berulang kali ke geto dari jaringan lokal Data Center dan periksa rasio responnya.
-16. Gojo berdiri di perbatasan DMZ sebagai gerbang publik tunggal bagi seluruh client dari luar maupun dalam. Konfigurasikan Nginx pada gojo untuk melayani domain jujutsu.<xxxx>.com dan www.jujutsu.<xxxx>.com menggunakan metode Path-Based Routing. Atur agar request root (/) diteruskan secara Round Robin ke worker frontend (maki dan panda), sedangkan request ke path /api diteruskan langsung ke geto. Uji dari client Divisi A atau B bahwa akses ke web utama dibalas oleh Maki/Panda, sedangkan akses ke /api diteruskan dan dijawab oleh Nanami/Todo.
-17. Komando pusat perlu mengetahui IP asli klien yang mengirimkan request tanpa tertukar dengan IP proxy perantara. Konfigurasikan gojo dan geto agar meneruskan informasi alamat klien melalui header X-Real-IP dan X-Forwarded-For. Pastikan geto hanya mempercayai informasi alamat klien yang diterima dari proxy terpercaya, dan skrip API menyimpan alamat klien yang telah diverifikasi ke kolom client_ip pada tabel request_logs di database yaga. Uji dengan mengirimkan request dari klien Network 2 dan Network 3 ke endpoint /api, kemudian periksa database untuk memastikan alamat yang tercatat sesuai dengan IP klien asal, bukan IP gojo atau geto.
+## 13. Konfigurasi Database Master-Slave (MariaDB pada Yaga dan Inumaki)
+
+> Kepala Sekolah Yaga dan Inumaki mendirikan database terpusat yang redundan agar log aktivitas kutukan tetap aman tersimpan. Konfigurasikan MariaDB pada yaga sebagai DB-Master dan inumaki sebagai DB-Slave. Buat database db_shibuya_<xxxx> beserta tabel request_logs di Master, aktifkan binary logging (log-bin, server-id), lalu hubungkan inumaki sebagai Slave yang menyalin data secara realtime dengan CHANGE MASTER TO. Berikan hak akses remote bagi seluruh node di Network 4, lalu buktikan replikasi berhasil dengan memasukkan data baru di Master dan memeriksa hasilnya di Slave.
+
+### Langkah Konfigurasi
+
+#### A. Konfigurasi DB Master pada Yaga
+Pada node **yaga** (`10.78.4.9`), buat skrip `/root/setup_yaga.sh` untuk menginstal MariaDB Server, mengaktifkan *binary logging* (`server-id = 1`, `log_bin`), membuka akses jaringan (`bind-address = 0.0.0.0`), membuat user replikasi serta user aplikasi untuk Network 4 (`10.78.4.%`), dan menyiapkan database `db_shibuya_k29` beserta tabel `request_logs`[cite: 1, 2, 4]:
+
+```bash
+cat << 'EOF' > /root/setup_yaga.sh
+#!/bin/bash
+# 1. Pastikan nameserver awal aktif untuk instalasi paket
+echo "nameserver 192.168.122.1" > /etc/resolv.conf
+
+# 2. Instalasi MariaDB Server
+apt-get update
+apt-get install -y mariadb-server
+
+# 3. Siapkan direktori kerja dan izin akses log (Mencegah error socket/index)
+mkdir -p /run/mysqld /var/log/mysql /var/lib/mysql
+chown -R mysql:mysql /run/mysqld /var/log/mysql /var/lib/mysql
+chmod -R 755 /run/mysqld /var/log/mysql
+
+# 4. Konfigurasi 50-server.cnf (Buka bind-address & aktifkan Binary Logging)
+cat << 'CNF' > /etc/mysql/mariadb.conf.d/50-server.cnf
+[server]
+[mysqld]
+user                    = mysql
+pid-file                = /run/mysqld/mysqld.pid
+socket                  = /run/mysqld/mysqld.sock
+port                    = 3306
+basedir                 = /usr
+datadir                 = /var/lib/mysql
+tmpdir                  = /tmp
+lc-messages-dir         = /usr/share/mysql
+lc-messages             = en_US
+skip-external-locking
+
+# Mengizinkan akses remote dari Network 4
+bind-address            = 0.0.0.0
+
+# Konfigurasi Master & Binary Logging
+server-id               = 1
+log_bin                 = /var/log/mysql/mariadb-bin
+binlog_do_db            = db_shibuya_k29
+expire_logs_days        = 10
+character-set-server    = utf8mb4
+collation-server        = utf8mb4_general_ci
+
+[embedded]
+[mariadb]
+[mariadb-10.5]
+CNF
+
+# 5. Restart layanan MariaDB untuk memuat konfigurasi baru
+service mariadb restart
+
+# 6. Konfigurasi User, Hak Akses Network 4, Database, dan Tabel
+PREFIX_IP="10.78"
+
+mariadb -u root << SQL
+-- Buat user khusus untuk replikasi Slave (inumaki)
+CREATE USER IF NOT EXISTS 'repl_user'@'${PREFIX_IP}.4.%' IDENTIFIED BY 'repl_pass';
+GRANT REPLICATION SLAVE ON *.* TO 'repl_user'@'${PREFIX_IP}.4.%';
+
+-- Berikan hak akses remote bagi seluruh node di Network 4 (Worker API, dll)
+CREATE USER IF NOT EXISTS 'shibuya_app'@'${PREFIX_IP}.4.%' IDENTIFIED BY 'shibuya_pass';
+GRANT ALL PRIVILEGES ON db_shibuya_k29.* TO 'shibuya_app'@'${PREFIX_IP}.4.%';
+FLUSH PRIVILEGES;
+
+-- Buat database dan tabel request_logs
+CREATE DATABASE IF NOT EXISTS db_shibuya_k29;
+USE db_shibuya_k29;
+CREATE TABLE IF NOT EXISTS request_logs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    worker_name VARCHAR(50),
+    client_ip VARCHAR(45) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+SQL
+
+# 7. Tampilkan posisi Binary Log untuk dicatat ke Slave
+echo "=== CATAT FILE DAN POSITION DI BAWAH INI UNTUK INUMAKI ==="
+mariadb -u root -e "SHOW MASTER STATUS\G"
+EOF
+```
+
+Berikan izin eksekusi dan jalankan skrip pada **yaga**[cite: 3]:
+```bash
+chmod +x /root/setup_yaga.sh
+bash /root/setup_yaga.sh
+```
+
+#### B. Konfigurasi DB Slave pada Inumaki
+Pada node **inumaki**, buat skrip `/root/setup_inumaki.sh` dengan `server-id = 2`, `read_only = 1`, dan arahkan konfigurasi `CHANGE MASTER TO` ke IP Master Yaga (`10.78.4.9`) sesuai nama file `mariadb-bin.000002` dan posisi `507` dari hasil `SHOW MASTER STATUS` di Yaga[cite: 3, 4, 5]:
+
+```bash
+cat << 'EOF' > /root/setup_inumaki.sh
+#!/bin/bash
+# 1. Pastikan nameserver awal aktif untuk instalasi paket
+echo "nameserver 192.168.122.1" > /etc/resolv.conf
+
+# 2. Instalasi MariaDB Server
+apt-get update
+apt-get install -y mariadb-server
+
+# 3. Konfigurasi 50-server.cnf (Tetapkan server-id = 2)
+cat << 'CNF' > /etc/mysql/mariadb.conf.d/50-server.cnf
+[server]
+[mysqld]
+user                    = mysql
+pid-file                = /run/mysqld/mysqld.pid
+socket                  = /run/mysqld/mysqld.sock
+port                    = 3306
+basedir                 = /usr
+datadir                 = /var/lib/mysql
+tmpdir                  = /tmp
+lc-messages-dir         = /usr/share/mysql
+lc-messages             = en_US
+skip-external-locking
+bind-address            = 0.0.0.0
+
+# Konfigurasi Slave (server-id wajib berbeda dari yaga)
+server-id               = 2
+relay-log               = /var/log/mysql/mariadb-relay-bin
+log_bin                 = /var/log/mysql/mariadb-bin
+binlog_do_db            = db_shibuya_k29
+read_only               = 1
+character-set-server    = utf8mb4
+collation-server        = utf8mb4_general_ci
+CNF
+
+# 4. Restart layanan MariaDB
+service mariadb restart
+
+# 5. Siapkan skema dasar dan hubungkan ke Master (yaga)
+IP_YAGA="10.78.4.9"
+LOG_FILE="mariadb-bin.000002"
+LOG_POS=507
+
+mariadb -u root << SQL
+STOP SLAVE;
+
+-- Siapkan struktur database dan tabel agar sinkron dengan posisi terakhir yaga
+CREATE DATABASE IF NOT EXISTS db_shibuya_k29;
+USE db_shibuya_k29;
+CREATE TABLE IF NOT EXISTS request_logs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    worker_name VARCHAR(50),
+    client_ip VARCHAR(45) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Konfigurasi koneksi ke Master (yaga)
+CHANGE MASTER TO
+    MASTER_HOST='${IP_YAGA}',
+    MASTER_USER='repl_user',
+    MASTER_PASSWORD='repl_pass',
+    MASTER_LOG_FILE='${LOG_FILE}',
+    MASTER_LOG_POS=${LOG_POS};
+
+START SLAVE;
+SQL
+
+# 6. Periksa status replikasi
+echo "=== CEK STATUS REPLIKASI SLAVE ==="
+mariadb -u root -e "SHOW SLAVE STATUS\G" | grep -E "Slave_IO_Running:|Slave_SQL_Running:|Last_Error:"
+EOF
+```
+
+Berikan izin eksekusi dan jalankan skrip pada **inumaki**[cite: 5]:
+```bash
+chmod +x /root/setup_inumaki.sh
+bash /root/setup_inumaki.sh
+```
+
+#### C. Pengujian dan Pembuktian Replikasi Database
+Jalankan perintah verifikasi berikut pada **yaga** dan **inumaki**[cite: 5, 6]:
+
+```bash
+# 1. Pembuktian konfigurasi DB Master, Binlog, dan struktur tabel di Yaga
+mariadb -u root -e "SHOW VARIABLES LIKE 'server_id'; SHOW VARIABLES LIKE 'log_bin'; SHOW MASTER STATUS;"
+mariadb -u root -D db_shibuya_k29 -e "SHOW TABLES; DESCRIBE request_logs;"
+
+# 2. Pembuktian hak akses remote Network 4 dan uji koneksi ke Yaga
+mariadb -u root -e "SELECT User, Host FROM mysql.user WHERE Host LIKE '%.4.%';"
+mariadb -h 10.78.4.9 -u shibuya_app -pshibuya_pass -D db_shibuya_k29 -e "SELECT 'Koneksi Remote Berhasil' AS Status;"
+
+# 3. Pemeriksaan status koneksi Slave di Inumaki
+mariadb -u root -e "SHOW SLAVE STATUS\G"
+
+# 4. Uji replikasi data secara realtime (Insert di Yaga, lalu periksa di Inumaki)
+# Pada Yaga:
+mariadb -u root -D db_shibuya_k29 -e "INSERT INTO request_logs (worker_name, client_ip) VALUES ('demo_praktikum', '10.78.2.99');"
+mariadb -u root -e "SHOW MASTER STATUS;"
+
+# Pada Inumaki:
+mariadb -u root -D db_shibuya_k29 -e "SELECT * FROM request_logs;"
+```
+
+### Lampiran Bukti dan Pengujian
+
+- **Verifikasi Binary Log dan Struktur Tabel pada Master (Yaga):**
+  Variabel `server_id` bernilai `1`, `log_bin` berstatus `ON` pada file `mariadb-bin.000002` (posisi `507`), dan tabel `request_logs` telah terbentuk di dalam `db_shibuya_k29`[cite: 5].
+
+- **Verifikasi Hak Akses Remote Network 4 pada Yaga:**
+  User `repl_user` dan `shibuya_app` terdaftar dengan host `10.78.4.%` dan pengujian login remote ke `10.78.4.9` mengembalikan status `Koneksi Remote Berhasil`[cite: 6].
+
+- **Verifikasi Replikasi Realtime pada Slave (Inumaki):**
+  Data yang dimasukkan pada Master (`demo_praktikum`) otomatis tersalin ke tabel `request_logs` pada node Slave Inumaki[cite: 6, 13].
+
+---
+
+## 14. Konfigurasi Web Frontend (Maki & Panda) dan API Worker (Nanami, Todo, Kirara) beserta Pembatasan Akses
+
+> Para penyihir lapangan bersiaga di Data Center sebagai pekerja backend untuk memproses aplikasi. Pasang Nginx dan PHP-FPM pada maki dan panda untuk menyajikan web frontend yang menampilkan hostname masing-masing. Pada nanami, todo, dan kirara, siapkan layanan API yang mencatat log request ke database yaga. Konfigurasikan virtual host agar worker merespons domain layanan yang ditentukan. Batasi akses langsung dari klien ke worker, web worker hanya menerima trafik melalui jalur proxy web yang ditentukan, sedangkan worker API hanya menerima trafik melalui geto. Uji bahwa akses langsung dari klien ditolak, sementara akses melalui reverse proxy tetap berhasil.
+
+### Langkah Konfigurasi
+
+#### A. Konfigurasi Web Frontend Worker (Maki dan Panda)
+Pada node **maki** (`10.78.4.12`) dan **panda** (`10.78.4.13`), buat skrip `/root/setup_frontend.sh` untuk menginstal Nginx serta PHP-FPM, menampilkan hostname masing-masing worker, dan membatasi akses (`allow`) agar hanya menerima trafik dari proxy **gojo** (`10.78.1.4`)[cite: 1, 7, 8]:
+
+```bash
+nano /root/setup_frontend.sh
+```
+
+```bash
+#!/bin/bash
+# 1. Set nameserver awal untuk instalasi paket
+echo "nameserver 192.168.122.1" > /etc/resolv.conf
+
+# 2. Instalasi Nginx dan PHP-FPM
+apt-get update
+apt-get install -y nginx php-fpm
+
+# 3. Deteksi otomatis versi & socket PHP-FPM yang terpasang di debinet
+PHP_SOCK=$(find /run/php/ -name "php*-fpm.sock" | head -n 1)
+if [ -z "$PHP_SOCK" ]; then
+    for svc in $(service --status-all 2>&1 | grep -o 'php.*-fpm'); do
+        service "$svc" start
+    done
+    PHP_SOCK=$(find /run/php/ -name "php*-fpm.sock" | head -n 1)
+fi
+echo "Menggunakan PHP Socket: $PHP_SOCK"
+
+# 4. Siapkan direktori dan file PHP Frontend (menampilkan hostname masing-masing)
+mkdir -p /var/www/jujutsu
+cat << 'PHP' > /var/www/jujutsu/index.php
+<?php
+header('Content-Type: text/html; charset=utf-8');
+$worker = gethostname();
+echo "<h1>Jujutsu High Frontend Worker</h1>";
+echo "<p>Responded by: <strong>" . htmlspecialchars($worker) . "</strong></p>";
+?>
+PHP
+
+chown -R www-data:www-data /var/www/jujutsu
+
+# 5. Konfigurasi Virtual Host & Pembatasan Akses (Hanya izinkan dari gojo)
+IP_GOJO="10.78.1.4"
+cat << NGINX > /etc/nginx/sites-available/jujutsu
+server {
+    listen 80 default_server;
+    server_name _;
+    return 444;
+}
+
+server {
+    listen 80;
+    server_name jujutsu.k29.com [www.jujutsu.k29.com](https://www.jujutsu.k29.com);
+    root /var/www/jujutsu;
+    index index.php index.html;
+
+    allow ${IP_GOJO};
+    allow 127.0.0.1;
+    deny all;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php\$ {
+        fastcgi_pass unix:${PHP_SOCK};
+        include snippets/fastcgi-php.conf;
+    }
+}
+NGINX
+
+# 6. Aktifkan konfigurasi dan restart service
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/jujutsu /etc/nginx/sites-enabled/jujutsu
+PHP_SVC=$(service --status-all 2>&1 | grep -o 'php.*-fpm' | head -n 1)
+service "$PHP_SVC" restart
+nginx -t && service nginx restart
+```
+
+Berikan izin eksekusi dan jalankan skrip pada **maki** dan **panda**[cite: 8]:
+```bash
+chmod +x /root/setup_frontend.sh
+bash /root/setup_frontend.sh
+```
+
+#### B. Konfigurasi API Worker (Nanami, Todo, dan Kirara)
+Pada node **nanami** (`10.78.4.14`), **todo** (`10.78.4.15`), dan **kirara** (`10.78.4.16`), buat skrip `/root/setup_api_worker.sh` untuk memasang Nginx, PHP-FPM, serta `php-mysql`, menyiapkan endpoint API yang mencatat log ke database **yaga** (`10.78.4.9`), serta membatasi akses agar hanya menerima request dari **geto** (`10.78.4.2`)[cite: 1, 8, 9, 10, 11]:
+
+```bash
+nano /root/setup_api_worker.sh
+```
+
+```bash
+#!/bin/bash
+# 1. Set nameserver awal untuk instalasi paket
+echo "nameserver 192.168.122.1" > /etc/resolv.conf
+
+# 2. Instalasi Nginx, PHP-FPM, dan ekstensi PHP-MySQL
+apt-get update
+apt-get install -y nginx php-fpm php-mysql
+
+# 3. Deteksi otomatis socket PHP-FPM
+PHP_SOCK=$(find /run/php/ -name "php*-fpm.sock" | head -n 1)
+if [ -z "$PHP_SOCK" ]; then
+    for svc in $(service --status-all 2>&1 | grep -o 'php.*-fpm'); do
+        service "$svc" start
+    done
+    PHP_SOCK=$(find /run/php/ -name "php*-fpm.sock" | head -n 1)
+fi
+echo "Menggunakan PHP Socket: $PHP_SOCK"
+
+# 4. Sesuaikan IP Yaga (DB Master) dan IP Geto (Internal Load Balancer)
+IP_YAGA="10.78.4.9"
+IP_GETO="10.78.4.2"
+
+# 5. Buat skrip API PHP yang mencatat log ke database yaga
+mkdir -p /var/www/jujutsu
+cat << PHP > /var/www/jujutsu/index.php
+<?php
+header('Content-Type: application/json');
+\$worker_name = gethostname();
+\$trusted_proxy = '${IP_GETO}';
+\$remote_addr = \$_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+
+// Ambil IP asli klien HANYA jika trafik berasal dari proxy terpercaya (geto)
+\$client_ip = \$remote_addr;
+if (\$remote_addr === \$trusted_proxy || \$remote_addr === '127.0.0.1') {
+    if (!empty(\$_SERVER['HTTP_X_REAL_IP'])) {
+        \$client_ip = trim(\$_SERVER['HTTP_X_REAL_IP']);
+    } elseif (!empty(\$_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        \$ip_list = explode(',', \$_SERVER['HTTP_X_FORWARDED_FOR']);
+        \$client_ip = trim(\$ip_list[0]);
+    }
+}
+
+// Koneksi ke MariaDB Master (yaga) sesuai kredensial Soal 13
+\$db_host = '${IP_YAGA}';
+\$db_user = 'shibuya_app';
+\$db_pass = 'shibuya_pass';
+\$db_name = 'db_shibuya_k29';
+
+\$mysqli = @new mysqli(\$db_host, \$db_user, \$db_pass, \$db_name);
+if (\$mysqli->connect_error) {
+    http_response_code(500);
+    echo json_encode([
+        'status' => 'error',
+        'worker' => \$worker_name,
+        'message' => 'DB Connection Failed: ' . \$mysqli->connect_error
+    ]);
+    exit;
+}
+
+\$stmt = \$mysqli->prepare("INSERT INTO request_logs (worker_name, client_ip) VALUES (?, ?)");
+\$stmt->bind_param("ss", \$worker_name, \$client_ip);
+\$stmt->execute();
+\$insert_id = \$stmt->insert_id;
+\$stmt->close();
+\$mysqli->close();
+
+echo json_encode([
+    'status' => 'success',
+    'worker' => \$worker_name,
+    'client_ip' => \$client_ip,
+    'log_id' => \$insert_id
+]) . "\n";
+?>
+PHP
+
+chown -R www-data:www-data /var/www/jujutsu
+
+# 6. Konfigurasi Virtual Host & Pembatasan Akses (Hanya izinkan dari geto)
+cat << NGINX > /etc/nginx/sites-available/jujutsu_api
+# Blokir request dengan Host header yang tidak dikenal
+server {
+    listen 80 default_server;
+    server_name _;
+    return 444;
+}
+
+# Virtual Host Layanan API
+server {
+    listen 80;
+    server_name jujutsu.k29.com [www.jujutsu.k29.com](https://www.jujutsu.k29.com) api.jujutsu.k29.com api_cluster geto ${IP_GETO};
+    root /var/www/jujutsu;
+    index index.php;
+
+    # Batasi akses: Worker API hanya menerima trafik melalui geto
+    allow ${IP_GETO};
+    allow 127.0.0.1;
+    deny all;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:${PHP_SOCK};
+    }
+}
+NGINX
+
+# 7. Aktifkan konfigurasi dan restart service
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/jujutsu_api /etc/nginx/sites-enabled/jujutsu_api
+PHP_SVC=$(service --status-all 2>&1 | grep -o 'php.*-fpm' | head -n 1)
+service "$PHP_SVC" restart
+nginx -t && service nginx restart
+```
+
+Berikan izin eksekusi dan jalankan skrip pada **nanami**, **todo**, dan **kirara**[cite: 11]:
+```bash
+chmod +x /root/setup_api_worker.sh && bash /root/setup_api_worker.sh
+```
+
+#### C. Pengujian Pembatasan Akses Langsung vs Akses via Proxy
+1. **Uji Akses Langsung dari Client (Itadori - Harus Ditolak / 403 Forbidden):**[cite: 11]
+   ```bash
+   curl -i -H "Host: jujutsu.k29.com" [http://10.78.4.12/](http://10.78.4.12/)
+   curl -i -H "Host: jujutsu.k29.com" [http://10.78.4.14/api](http://10.78.4.14/api)
+   ```
+2. **Uji Akses ke Frontend Worker Melalui Proxy Gojo:**[cite: 11]
+   ```bash
+   curl -i -H "Host: jujutsu.k29.com" [http://10.78.4.12/](http://10.78.4.12/)
+   curl -i -H "Host: jujutsu.k29.com" [http://10.78.4.13/](http://10.78.4.13/)
+   ```
+3. **Uji Akses ke API Worker Melalui Proxy Geto:**[cite: 12]
+   ```bash
+   curl -i -H "Host: jujutsu.k29.com" [http://10.78.4.14/api](http://10.78.4.14/api)
+   curl -i -H "Host: jujutsu.k29.com" [http://10.78.4.15/api](http://10.78.4.15/api)
+   curl -i -H "Host: jujutsu.k29.com" [http://10.78.4.16/api](http://10.78.4.16/api)
+   ```
+4. **Verifikasi Pencatatan Log pada Database:**[cite: 13]
+   ```bash
+   mariadb -u root -e "SELECT * FROM db_shibuya_k29.request_logs;"
+   ```
+
+### Lampiran Bukti dan Pengujian
+
+- **Uji Akses Frontend Worker dari Gojo (Maki dan Panda):**
+  Request HTTP dari Gojo (`10.78.1.4`) ke Maki (`10.78.4.12`) dan Panda (`10.78.4.13`) berhasil dijawab dengan `HTTP/1.1 200 OK` beserta hostname masing-masing worker[cite: 12].
+
+- **Uji Akses API Worker dari Geto (Nanami, Todo, dan Kirara):**
+  Request HTTP dari Geto (`10.78.4.2`) ke Nanami (`10.78.4.14`), Todo (`10.78.4.15`), dan Kirara (`10.78.4.16`) berhasil mengembalikan JSON `status: success` beserta nama worker dan `log_id` yang tercatat di database[cite: 13].
+
+---
+
+## 15. Konfigurasi Internal Load Balancer dengan Weighted Round Robin pada Geto
+
+> Geto bertugas mengendalikan pembagian beban request API di internal Data Center agar server tidak tumbang bersamaan. Konfigurasikan Nginx pada geto sebagai Load Balancer internal dengan upstream api_cluster yang mengarahkan trafik ke nanami dan todo. Terapkan algoritma Weighted Round Robin dengan bobot 3:1, di mana nanami menerima porsi beban tiga kali lebih banyak daripada todo. Buktikan distribusi beban ini dengan melakukan loop request berulang kali ke geto dari jaringan lokal Data Center dan periksa rasio responnya.
+
+### Langkah Konfigurasi
+
+#### A. Konfigurasi Load Balancer Nginx pada Geto
+Pada node **geto** (`10.78.4.2`), buat skrip `/root/setup.sh` untuk mengonfigurasi blok `upstream api_cluster` dengan algoritma *Weighted Round Robin* berbobot `weight=3` pada **nanami** (`10.78.4.14`) dan `weight=1` pada **todo** (`10.78.4.15`)[cite: 13, 14]:
+
+```bash
+cat << 'EOF' > /root/setup.sh
+#!/bin/bash
+echo "nameserver 192.168.122.1" > /etc/resolv.conf
+apt-get update
+apt-get install -y nginx
+
+cat << 'NGINX' > /etc/nginx/sites-available/default
+upstream api_cluster {
+    server 10.78.4.14:80 weight=3; # nanami
+    server 10.78.4.15:80 weight=1; # todo
+}
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location / {
+        proxy_pass http://api_cluster;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+NGINX
+
+ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+nginx -t && service nginx restart
+EOF
+```
+
+Berikan izin eksekusi dan jalankan skrip pada **geto**[cite: 14]:
+```bash
+chmod +x /root/setup.sh
+bash /root/setup.sh
+```
+
+#### B. Pengujian Distribusi Beban (Rasio 3:1) dari Tengen
+Dari node **tengen** (`10.78.4.10`) yang berada di jaringan lokal Data Center (Network 4), lakukan pengujian koneksi tunggal dan *looping* 12 request beruntun menuju IP **geto** (`10.78.4.2`)[cite: 14, 15]:
+
+```bash
+curl -i [http://10.78.4.2/](http://10.78.4.2/)
+for i in $(seq 1 12); do curl -s [http://10.78.4.2/](http://10.78.4.2/); echo ""; done
+```
+
+### Lampiran Bukti dan Pengujian
+
+- **Pengujian Distribusi Beban Weighted Round Robin (3:1) dari Tengen:**
+  Dari 12 request beruntun yang dikirimkan oleh Tengen (`10.78.4.10`) ke Geto (`10.78.4.2`), setiap 4 siklus request selalu didistribusikan sebanyak 3 kali ke **nanami** dan 1 kali ke **todo** (total 9 respons dari `nanami` dan 3 respons dari `todo`), membuktikan rasio bobot 3:1 berjalan akurat[cite: 15].
+
+---
+
+## 17. Pelacakan IP Asli Klien (X-Real-IP & X-Forwarded-For) pada Gojo, Geto, dan Worker API
+
+> Komando pusat perlu mengetahui IP asli klien yang mengirimkan request tanpa tertukar dengan IP proxy perantara. Konfigurasikan gojo dan geto agar meneruskan informasi alamat klien melalui header X-Real-IP dan X-Forwarded-For. Pastikan geto hanya mempercayai informasi alamat klien yang diterima dari proxy terpercaya, dan skrip API menyimpan alamat klien yang telah diverifikasi ke kolom client_ip pada tabel request_logs di database yaga. Uji dengan mengirimkan request dari klien Network 2 dan Network 3 ke endpoint /api, kemudian periksa database untuk memastikan alamat yang tercatat sesuai dengan IP klien asal, bukan IP gojo atau geto.
+
+### Langkah Konfigurasi
+
+#### A. Konfigurasi Penerusan Header IP Klien pada Gojo
+Pada node **gojo** (`10.78.1.4`), buat skrip `/root/config_gojo.sh` untuk meneruskan IP asli klien menggunakan direktif `proxy_set_header X-Real-IP $remote_addr;` dan `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` baik pada blok `/` maupun `/api`[cite: 1, 15, 16]:
+
+```bash
+cat << 'EOF' > /root/config_gojo.sh
+#!/bin/bash
+PREFIX_IP="10.78"
+KELOMPOK="k29"
+IP_GETO="${PREFIX_IP}.4.2"
+IP_MAKI="${PREFIX_IP}.4.12"
+IP_PANDA="${PREFIX_IP}.4.13"
+
+cat << NGINX > /etc/nginx/sites-available/jujutsu
+upstream frontend_cluster {
+    server ${IP_MAKI};
+    server ${IP_PANDA};
+}
+
+server {
+    listen 80;
+    server_name jujutsu.${KELOMPOK}.com www.jujutsu.${KELOMPOK}.com;
+
+    location / {
+        proxy_pass http://frontend_cluster;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+
+    location /api {
+        proxy_pass http://${IP_GETO};
+        proxy_set_header Host \$host;
+        # Meneruskan IP asli klien yang terhubung ke gojo
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+}
+NGINX
+
+ln -sf /etc/nginx/sites-available/jujutsu /etc/nginx/sites-enabled/jujutsu
+rm -f /etc/nginx/sites-enabled/default
+nginx -t && service nginx reload
+EOF
+
+chmod +x /root/config_gojo.sh
+bash /root/config_gojo.sh
+```
+
+#### B. Konfigurasi Ekstraksi Trusted Real IP pada Geto
+Pada node **geto** (`10.78.4.2`), buat skrip `/root/config_geto.sh` dengan mengaktifkan modul `ngx_http_realip_module` (`set_real_ip_from 10.78.1.4;`, `real_ip_header X-Real-IP;`, `real_ip_recursive on;`) agar Geto hanya mempercayai ekstraksi IP klien yang dikirim oleh proxy **gojo**[cite: 1, 9, 17]:
+
+```bash
+cat << 'EOF' > /root/config_geto.sh
+#!/bin/bash
+PREFIX_IP="10.78"
+IP_GOJO="${PREFIX_IP}.1.4"
+IP_NANAMI="${PREFIX_IP}.4.14"
+IP_TODO="${PREFIX_IP}.4.15"
+
+cat << NGINX > /etc/nginx/sites-available/api_lb
+upstream api_cluster {
+    # Sesuai Soal 15: Weighted Round Robin 3:1 untuk nanami dan todo
+    server ${IP_NANAMI} weight=3;
+    server ${IP_TODO} weight=1;
+}
+
+server {
+    listen 80;
+    server_name _;
+
+    # Mempercayai HANYA proxy gojo untuk ekstraksi IP asli klien
+    set_real_ip_from ${IP_GOJO};
+    real_ip_header X-Real-IP;
+    real_ip_recursive on;
+
+    location / {
+        proxy_pass http://api_cluster;
+        proxy_set_header Host \$host;
+        # Karena real_ip_header aktif, \$remote_addr di sini sudah berisi IP asli klien
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+}
+NGINX
+
+ln -sf /etc/nginx/sites-available/api_lb /etc/nginx/sites-enabled/api_lb
+rm -f /etc/nginx/sites-enabled/default
+nginx -t && service nginx reload
+EOF
+
+chmod +x /root/config_geto.sh
+bash /root/config_geto.sh
+```
+
+#### C. Konfigurasi Verifikasi Real IP pada Worker API (Nanami, Todo, dan Kirara)
+Pada **nanami**, **todo**, dan **kirara**, perbarui konfigurasi Nginx agar menggunakan `set_real_ip_from 10.78.4.2;` (hanya mempercayai **geto**) serta pastikan skrip `index.php` memvalidasi `$_SERVER['REMOTE_ADDR']` menggunakan `filter_var($client_ip, FILTER_VALIDATE_IP)` sebelum menyimpannya ke tabel `request_logs` di database **yaga** (`10.78.4.9`)[cite: 17, 18, 19]:
+
+1. **Konfigurasi Virtual Host Nginx (`/etc/nginx/sites-available/jujutsu_api`):**[cite: 18]
+   ```nginx
+   server {
+       listen 80;
+       server_name jujutsu.k29.com [www.jujutsu.k29.com](https://www.jujutsu.k29.com) _;
+       root /var/www/jujutsu;
+       index index.php;
+
+       # Batasi akses hanya dari geto (Soal 14)
+       allow 10.78.4.2;
+       allow 127.0.0.1;
+       deny all;
+
+       # Hanya percaya header IP klien yang dikirim oleh geto (Soal 17)
+       set_real_ip_from 10.78.4.2;
+       real_ip_header X-Real-IP;
+       real_ip_recursive on;
+
+       location /api {
+           try_files $uri $uri/ /index.php?$query_string;
+       }
+
+       location ~ \.php$ {
+           include snippets/fastcgi-php.conf;
+           fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+           fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+           include fastcgi_params;
+       }
+   }
+   ```
+
+2. **Skrip PHP API (`/var/www/jujutsu/index.php`):**[cite: 18, 19]
+   ```php
+   <?php
+   header('Content-Type: application/json');
+
+   $db_host = '10.78.4.9';
+   $db_user = 'shibuya_app';
+   $db_pass = 'shibuya_pass';
+   $db_name = 'db_shibuya_k29';
+
+   // Karena Nginx worker sudah membatasi allow hanya dari geto dan memasang set_real_ip_from geto,
+   // maka REMOTE_ADDR adalah IP klien yang telah diverifikasi.
+   $client_ip = $_SERVER['REMOTE_ADDR'];
+   $x_forwarded_for = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $client_ip;
+   $hostname = gethostname();
+
+   // Validasi format IP sebelum disimpan
+   if (!filter_var($client_ip, FILTER_VALIDATE_IP)) {
+       http_response_code(400);
+       echo json_encode(["status" => "error", "message" => "Invalid Client IP"]);
+       exit;
+   }
+
+   $mysqli = new mysqli($db_host, $db_user, $db_pass, $db_name);
+   if ($mysqli->connect_error) {
+       http_response_code(500);
+       echo json_encode(["status" => "error", "message" => "DB Connection Failed: " . $mysqli->connect_error]);
+       exit;
+   }
+
+   // Menyimpan worker_name dan client_ip ke tabel request_logs sesuai Soal 17
+   $stmt = $mysqli->prepare("INSERT INTO request_logs (worker_name, client_ip) VALUES (?, ?)");
+   $stmt->bind_param("ss", $hostname, $client_ip);
+   $stmt->execute();
+   $stmt->close();
+   $mysqli->close();
+
+   echo json_encode([
+       "status" => "success",
+       "handled_by" => $hostname,
+       "verified_client_ip" => $client_ip,
+       "x_forwarded_for" => $x_forwarded_for
+   ]) . "\n";
+   ?>
+   ```
+
+#### D. Pengujian dari Klien Network 2, Network 3, dan Verifikasi Database
+1. **Pengujian dari Klien Network 2 (Contoh: Itadori):**[cite: 19]
+   ```bash
+   # Cek IP klien saat ini
+   ip a show eth0
+
+   # Kirim request ke endpoint /api
+   curl -i [http://jujutsu.k29.com/api](http://jujutsu.k29.com/api)
+   ```
+2. **Pengujian dari Klien Network 3 (Contoh: Ino / Kugisaki):**[cite: 19, 20]
+   ```bash
+   # Cek IP klien saat ini
+   ip a show eth0
+
+   # Kirim request ke endpoint /api
+   curl -i [http://jujutsu.k29.com/api](http://jujutsu.k29.com/api)
+   ```
+3. **Verifikasi Log IP Klien pada Database Yaga:**[cite: 20]
+   ```bash
+   mariadb -u root -e "USE db_shibuya_k29; SELECT * FROM request_logs ORDER BY id DESC LIMIT 10;"
+   ```
+
+### Lampiran Bukti dan Pengujian
+
+- **Pengujian Request `/api` dari Klien Network 2 dan Network 3:**
+  Respons JSON dari endpoint `http://jujutsu.k29.com/api` menampilkan `verified_client_ip` sesuai dengan IP asli klien di Network 2 (`10.78.2.x`) dan Network 3 (`10.78.3.x`)[cite: 19, 20].
+
+- **Verifikasi Tabel `request_logs` pada Database Yaga:**
+  Kolom `client_ip` pada tabel `request_logs` di Yaga mencatat alamat IP asli klien asal, bukan alamat IP proxy perantara Gojo (`10.78.1.4`) maupun Geto (`10.78.4.2`)[cite: 1, 9, 20].
+
 18. nanami dan todo merupakan worker API utama, sedangkan kirara disiapkan sebagai worker cadangan. Konfigurasikan upstream api_cluster pada geto agar kirara menjadi server backup, serta terapkan passive health check dengan parameter max_fails=2 dan fail_timeout=5s pada worker API utama. Pastikan kirara menjalankan layanan API yang kompatibel dengan endpoint utama. Simulasikan gangguan dengan menghentikan layanan Nginx atau layanan API pada nanami dan todo. Buktikan dari klien bahwa request ke /api dialihkan ke kirara dan menghasilkan respons API yang valid tanpa error 502 Bad Gateway.
 19. gojo bertugas mengoptimalkan layanan web sekaligus membatasi request berlebihan. Konfigurasikan Nginx Proxy Caching untuk halaman web frontend dengan masa berlaku cache 10 menit dan tambahkan header X-Cache-Status. Terapkan rate limiting pada path /api dengan batas 10 request per detik per IP klien. Buktikan bahwa request ke halaman web yang memenuhi syarat cache menghasilkan status MISS pada akses awal dan HIT pada akses berikutnya. Uji rate limiting secara terpisah dengan mengirimkan request beruntun ke /api, kemudian catat status respons yang dihasilkan ketika batas terlampaui.
 20. Sebelum Curtain di Shibuya resmi dibuka, Kusakabe memimpin audit untuk menguji kapasitas layanan. Dari terminal kusakabe, jalankan benchmark menggunakan Apache Benchmark dengan parameter -n 600 -c 30 menuju http://jujutsu.<xxxx>.com/. Catat Requests per Second (RPS), latensi, dan jumlah request yang gagal. Lakukan pengujian tambahan pada endpoint /api untuk mengamati efek rate limiting. Bandingkan hasil pengujian baseline dengan hasil ketika rate limiting aktif, serta gunakan access log gojo untuk membedakan kegagalan aplikasi, koneksi, dan request yang ditolak oleh kebijakan rate limit.
